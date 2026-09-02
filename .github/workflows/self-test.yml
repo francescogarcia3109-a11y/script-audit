@@ -1,0 +1,15 @@
+# This repository's own tests: the 61-script corpus, and the CLI's exit codes.
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq lua5.4
+      - name: Corpus - coverage 61/61, false alarms 0/61
+        run: lua5.4 tests/run_corpus.lua
+      - name: CLI - exit codes
+        run: bash cli/tests/run_cli_tests.sh

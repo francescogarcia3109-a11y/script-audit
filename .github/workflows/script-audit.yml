@@ -1,0 +1,18 @@
+# Drop this into any Rojo project. On every pull request it answers one
+# question: did this change add a new way to load code at runtime?
+name: Script Audit
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lua5.4
+      - name: Check for new code-loading sites
+        run: lua5.4 cli/scriptaudit.lua check src -b .scriptaudit-baseline

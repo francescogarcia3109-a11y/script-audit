@@ -1,0 +1,13 @@
+# Studio's lock files for open places
+*.rbxlx.lock
+*.rbxl.lock
+
+# generated test places - rebuild with tools/build_*_place.py
+dist/ScriptAuditTestPlace.rbxlx
+dist/ScriptAuditTestPlaceTampered.rbxlx
+dist/ScriptAuditStressPlace.rbxlx
+
+# working notes that are not part of the product
+_to_delete/
+_verify-payload.tgz
+_cli-payload.tgz

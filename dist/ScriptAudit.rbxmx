@@ -1,0 +1,2215 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+  <Item class="Folder" referent="RBX0">
+    <Properties>
+      <string name="Name">ScriptAudit</string>
+    </Properties>
+    <Item class="Script" referent="RBX1">
+      <Properties>
+        <string name="Name">Plugin</string>
+        <ProtectedString name="Source"><![CDATA[
+--!strict
+-- Studio wiring only. Every line of analysis lives in src/Scanner.lua, which
+-- runs under a plain `lua` binary so it can be tested outside Studio. That
+-- separation is the reason there is a measured number at all.
+
+local Selection = game:GetService("Selection")
+
+-- WHY THIS LINE EXISTS (do not remove)
+--   Scanner.lua chooses its Lexer import with:
+--       _G.__ROBLOX and require(script.Parent.Lexer) or require("Lexer")
+--   Under a plain `lua` binary the flag is nil, so it takes the package.path
+--   branch, which is what the corpus tests use. Studio has no package.path,
+--   so with the flag unset the plugin ERRORS ON LOAD. It has to be set before
+--   Scanner is required. Doing it here keeps Scanner.lua byte-identical to
+--   the file the 61-script corpus actually scored.
+_G.__ROBLOX = true
+
+local Scanner = require(script.Parent.Scanner)
+
+--------------------------------------------------------------------------------
+-- Baseline
+--------------------------------------------------------------------------------
+
+-- WHY A BASELINE IS THE POINT
+--   A one-off scan of a place you did not write tells you almost nothing you
+--   can act on: framework code loads modules dynamically, so a long list of
+--   sites is the normal, healthy state. What is actually worth an alarm is a
+--   site that WAS NOT THERE YESTERDAY.
+--
+--   So the plugin remembers the shape of the last scan you blessed, and every
+--   scan after that leads with what changed. A backdoor added by a
+--   collaborator, a free model dragged in, a plugin that edits your scripts -
+--   all of them show up as NEW against a baseline and are invisible in a
+--   single scan.
+--
+--   This is the same idea as watching a data feed for schema drift rather than
+--   re-reading the whole feed every day.
+
+local BASELINE_KEY = "ScriptAudit_baseline_v1"
+-- Settings are stored per plugin and read back on every scan. A place with
+-- tens of thousands of scripts would make that table a liability, so the
+-- baseline is capped and says so rather than silently holding a partial one.
+local BASELINE_MAX = 6000
+
+-- FNV-1a, 32-bit. Not security - just a short stable stand-in for "the set of
+-- findings in this script", so the baseline stays small.
+--
+-- The multiply is split into 16-bit halves on purpose. Lua numbers are
+-- doubles, and a straight `h * 16777619` reaches 7.2e16 for large h, past the
+-- 2^53 where a double stops being able to hold an exact integer. It would
+-- still be deterministic, but it would no longer be FNV and it would depend on
+-- float rounding. Each half here peaks near 1.1e12, which is exact.
+local function fnv1a(str: string): number
+	local h = 2166136261
+	for i = 1, #str do
+		h = bit32.bxor(h, string.byte(str, i))
+		local lo = bit32.band(h, 0xFFFF) * 16777619
+		local hi = bit32.band(bit32.rshift(h, 16) * 16777619, 0xFFFF)
+		h = bit32.band(lo + bit32.lshift(hi, 16), 0xFFFFFFFF)
+	end
+	return h
+end
+
+-- WHY THE BASELINE IS A LIST OF STRINGS AND NOT A MAP KEYED BY PATH
+--   The obvious shape is { ["ServerScriptService.Runtime"] = 12345 }. It does
+--   not work. Studio's plugin settings mangle dots in KEYS: every path written
+--   as a key came back as "ServerScriptService_Runtime", so on the next scan
+--   every real path looked new and every stored path looked gone. The first
+--   run against a modified place reported 6 new and 7 gone where the truth was
+--   1 and 0.
+--
+--   So the path goes in the VALUE, never the key. Entries are "<sig>|<path>"
+--   strings in a plain array, and the only keys are "saved" and "entries".
+--
+--   This is the bug that every test outside Studio would have missed, because
+--   nothing outside Studio has plugin settings.
+
+local function loadBaseline(): ({ [string]: number }?, string?)
+	local ok, v = pcall(function()
+		return plugin:GetSetting(BASELINE_KEY)
+	end)
+	if not ok or typeof(v) ~= "table" then return nil, nil end
+	local entries = (v :: any).entries
+	if typeof(entries) ~= "table" then return nil, nil end
+	local map: { [string]: number } = {}
+	for _, e in ipairs(entries) do
+		if typeof(e) == "string" then
+			local bar = string.find(e, "|", 1, true)
+			if bar then
+				local sig = tonumber(string.sub(e, 1, bar - 1))
+				local path = string.sub(e, bar + 1)
+				if sig and #path > 0 then map[path] = sig end
+			end
+		end
+	end
+	local stamp = (v :: any).saved
+	return map, (typeof(stamp) == "string") and stamp or nil
+end
+
+
+--------------------------------------------------------------------------------
+-- What counts as "this place"
+--------------------------------------------------------------------------------
+
+-- WHY A DENYLIST AND NOT A LIST OF SERVICES
+--   A plugin runs at plugin identity and can walk CoreGui and CorePackages,
+--   which hold hundreds of Roblox's own scripts whose .Source is denied. Those
+--   would land in the COULD NOT BE READ list, so a clean baseplate would open
+--   with four hundred lines of Roblox's own code reported as a hole in
+--   coverage. They are not part of the place and are not ours to audit.
+--
+--   The first version of this fix was an allowlist of fourteen service names.
+--   That is worse than the bug it fixed. "Coverage is the promise" and "here
+--   are the fourteen places I look" cannot both be true, and the list can only
+--   rot - TextChatService alone is where modern places keep chat modules, and
+--   it was missing. Anything Roblox ships from now on would be silently
+--   invisible, and the failure mode is a clean-looking report.
+--
+--   So: skip the two things that are demonstrably not ours, take everything
+--   else, and SAY ON SCREEN what was skipped.
+local SKIP: { [string]: boolean } = {
+	CoreGui = true,
+	CorePackages = true,
+	CoreScriptDebuggerManager = true,
+}
+
+local function placeRoots(): ({ Instance }, { string })
+	local out: { Instance } = {}
+	local skipped: { string } = {}
+	-- GetChildren, not a name list: a service that has never been instantiated
+	-- is not a child of the DataModel, and a service that does not exist cannot
+	-- be holding a script.
+	for _, svc in ipairs(game:GetChildren()) do
+		if SKIP[svc.Name] then
+			skipped[#skipped + 1] = svc.Name
+		else
+			out[#out + 1] = svc
+		end
+	end
+	return out, skipped
+end
+
+--------------------------------------------------------------------------------
+-- Toolbar
+--------------------------------------------------------------------------------
+
+local toolbar = plugin:CreateToolbar("Script Audit")
+
+-- An empty icon string gives a text-only button. `rbxassetid://0` does NOT -
+-- it asks Studio for asset 0, which does not exist, and renders a blank box
+-- that looks like the plugin failed to load.
+local buttonShow = toolbar:CreateButton(
+	"Script Audit", "Show or hide the report window", "")
+local buttonPlace = toolbar:CreateButton(
+	"Scan place", "List every place this game can load code at runtime", "")
+local buttonSelection = toolbar:CreateButton(
+	"Scan selection", "Same, but only what is selected in the Explorer", "")
+
+for _, b in ipairs({ buttonShow, buttonPlace, buttonSelection }) do
+	b.ClickableWhenViewportHidden = true
+end
+
+-- InitialEnabledShouldOverrideRestore is false, so Studio restores the open /
+-- closed state itself. Do NOT add a second GetSetting/SetSetting mechanism on
+-- top - two systems writing the same state is how the window ends up opening
+-- blank.
+local info = DockWidgetPluginGuiInfo.new(
+	Enum.InitialDockState.Float, false, false, 560, 440, 380, 260)
+local widget = plugin:CreateDockWidgetPluginGui("ScriptAuditWidget", info)
+widget.Title = "Script Audit"
+widget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+--------------------------------------------------------------------------------
+-- Colours
+--------------------------------------------------------------------------------
+
+-- Studio has a Light theme and a lot of people use it. Hardcoding one palette
+-- makes half the report invisible for them, so every colour here is either
+-- taken from the theme or picked from a light/dark pair.
+local DARK_SEV = {
+	critical = Color3.fromRGB(214, 78, 78),
+	high = Color3.fromRGB(219, 142, 52),
+	medium = Color3.fromRGB(186, 176, 66),
+	low = Color3.fromRGB(150, 150, 160),
+}
+local LIGHT_SEV = {
+	critical = Color3.fromRGB(163, 26, 26),
+	high = Color3.fromRGB(152, 84, 8),
+	medium = Color3.fromRGB(115, 105, 10),
+	low = Color3.fromRGB(105, 105, 115),
+}
+local KNOWN_SEV = { "critical", "high", "medium", "low" }
+local IS_KNOWN_SEV: { [string]: boolean } = {}
+for _, s in ipairs(KNOWN_SEV) do IS_KNOWN_SEV[s] = true end
+
+-- Constants, so a lookup that fails on the SECOND theme change falls back to a
+-- sane default instead of silently keeping the previous theme's colour.
+local D_TEXT = Color3.fromRGB(220, 220, 220)
+local D_BACK = Color3.fromRGB(46, 46, 46)
+local D_DIM = Color3.fromRGB(150, 150, 160)
+local D_HOVER = Color3.fromRGB(85, 85, 85)
+
+local themeText, themeBack, themeDim, themeHover = D_TEXT, D_BACK, D_DIM, D_HOVER
+local SEV = DARK_SEV
+
+local function sevColour(name: any): Color3
+	return SEV[name] or themeDim
+end
+
+local rerender: (() -> ())? = nil
+
+local function refreshTheme()
+	local ok, theme = pcall(function()
+		return settings().Studio.Theme
+	end)
+	if ok and theme then
+		-- Enum members are looked up BY NAME inside the pcall on purpose.
+		-- Written as `Enum.StudioStyleGuideColor.DimmedText` the index happens
+		-- while evaluating the argument, outside any pcall, so one member
+		-- missing from this Studio build would kill the plugin at load.
+		local function col(name: string, modifier: string?, fallback: Color3): Color3
+			local okc, c = pcall(function()
+				local item = (Enum.StudioStyleGuideColor :: any)[name]
+				if modifier then
+					return theme:GetColor(item, (Enum.StudioStyleGuideModifier :: any)[modifier])
+				end
+				return theme:GetColor(item)
+			end)
+			if okc and typeof(c) == "Color3" then return c end
+			return fallback
+		end
+		themeText = col("MainText", nil, D_TEXT)
+		themeBack = col("MainBackground", nil, D_BACK)
+		themeDim = col("DimmedText", nil, D_DIM)
+		-- Studio's own list-row hover colour. Tinting a mid-grey Button colour
+		-- over a mid-grey background at 85% transparency was a difference of
+		-- about four values out of 255 - present in the code, invisible on the
+		-- screen. This is the colour Studio actually uses for the job.
+		themeHover = col("Item", "Hover", D_HOVER)
+	end
+	-- Luminance, not a theme-name string: a custom theme is still light or dark.
+	local lum = themeBack.R * 0.299 + themeBack.G * 0.587 + themeBack.B * 0.114
+	SEV = (lum > 0.5) and LIGHT_SEV or DARK_SEV
+	if rerender then rerender() end
+end
+
+--------------------------------------------------------------------------------
+-- Scan
+--------------------------------------------------------------------------------
+
+type Row = { path: string, inst: Instance?, finding: any }
+type Result = {
+	rows: { Row },
+	sites: number,
+	scanned: number,
+	unreadable: { string },
+	skipped: { string },
+	sigs: { [string]: number },
+	scriptPaths: { string },
+	seconds: number,
+	cancelled: boolean,
+	selectionOnly: boolean,
+}
+
+local scanning = false
+local activeIsSelection: boolean? = nil
+local cancelRequested = false
+
+local function sourcesToScan(selectionOnly: boolean): ({ Instance }, { string })
+	local out: { Instance } = {}
+	local seen: { [Instance]: boolean } = {}
+	local roots: { Instance }, skipped: { string }
+	if selectionOnly then
+		roots, skipped = Selection:Get(), {}
+	else
+		roots, skipped = placeRoots()
+	end
+	for _, root in ipairs(roots) do
+		if root:IsA("LuaSourceContainer") and not seen[root] then
+			seen[root] = true
+			out[#out + 1] = root
+		end
+		for _, d in ipairs(root:GetDescendants()) do
+			if d:IsA("LuaSourceContainer") and not seen[d] then
+				seen[d] = true
+				out[#out + 1] = d
+			end
+		end
+	end
+	return out, skipped
+end
+
+-- WHY THIS YIELDS
+--   A place with a few thousand scripts is ordinary. Tokenising all of them in
+--   one frame freezes Studio hard enough that Windows offers to kill it, and a
+--   plugin that appears to hang the editor is a plugin nobody keeps installed.
+--   Cancel possible. task.wait() rather than Heartbeat:Wait() - Heartbeat does
+--   fire in edit mode, but task.wait() does not require me to be right.
+--
+-- WHY IT YIELDS ON A CLOCK AND NOT A COUNT
+--   It used to yield every 25 scripts. task.wait() parks until the next frame,
+--   so on a 20,000-script place that is 800 frames = about 13 seconds of
+--   deliberate waiting, for roughly 1.3 seconds of actual work. Measured:
+--   20,000 scripts took 13.44s, and ten times fewer scripts took 1.34s - the
+--   time was almost entirely frames, not analysis.
+--
+--   Yielding on elapsed time instead gives the same responsiveness (the
+--   window still repaints ~20 times a second, cancel still lands within a
+--   frame) without padding the scan with idle frames. The count-based
+--   fallback stays so a pathologically slow single script cannot stall the
+--   UI for longer than YIELD_MAX_SCRIPTS.
+local YIELD_SECONDS = 0.05
+local YIELD_MAX_SCRIPTS = 400
+
+local function scan(selectionOnly: boolean, onProgress: ((number, number) -> ())?): Result
+	local started = os.clock()
+	local list, skipped = sourcesToScan(selectionOnly)
+	local rows: { Row } = {}
+	local unreadable: { string } = {}
+	local sites = 0
+	local cancelled = false
+	local lastYield = os.clock()
+	local lastYieldAt = 0
+
+	for i, inst in ipairs(list) do
+		if cancelRequested then
+			cancelled = true
+			break
+		end
+		-- Reading .Source needs script-injection permission. Without it this
+		-- errors rather than silently returning "", which is the only reason
+		-- we can tell "clean" apart from "never looked at".
+		local ok, src = pcall(function()
+			return (inst :: any).Source
+		end)
+		if not ok or typeof(src) ~= "string" then
+			unreadable[#unreadable + 1] = inst:GetFullName()
+		else
+			local okAnalyse, r = pcall(Scanner.analyse, src, inst:GetFullName())
+			if not okAnalyse then
+				-- One malformed script must not take the whole report with it.
+				unreadable[#unreadable + 1] = inst:GetFullName()
+					.. "   (analyser error: " .. tostring(r):sub(1, 80) .. ")"
+			else
+				sites += r.siteCount or 0
+				for _, f in ipairs(r.findings) do
+					rows[#rows + 1] = { path = inst:GetFullName(), inst = inst, finding = f }
+				end
+			end
+		end
+		if (os.clock() - lastYield) >= YIELD_SECONDS
+			or (i - lastYieldAt) >= YIELD_MAX_SCRIPTS then
+			if onProgress then onProgress(i, #list) end
+			task.wait()
+			lastYield = os.clock()
+			lastYieldAt = i
+		end
+	end
+
+	-- One number per script standing for "the set of findings in it". Built
+	-- from severity+line+rule, sorted, so it does not move when the report
+	-- ordering does.
+	local perPath: { [string]: { string } } = {}
+	for _, r in ipairs(rows) do
+		local t = perPath[r.path]
+		if not t then t = {}; perPath[r.path] = t end
+		t[#t + 1] = ("%s|%s|%s"):format(
+			tostring(r.finding.severity), tostring(r.finding.line), tostring(r.finding.rule))
+	end
+	local sigs: { [string]: number } = {}
+	local scriptPaths: { string } = {}
+	for _, inst in ipairs(list) do
+		local p = inst:GetFullName()
+		scriptPaths[#scriptPaths + 1] = p
+		local t = perPath[p]
+		if t then
+			table.sort(t)
+			sigs[p] = fnv1a(table.concat(t, "\n"))
+		else
+			-- A script with no findings still has to be in the baseline, or
+			-- "findings appeared in a file that had none" reads as a new file.
+			sigs[p] = 0
+		end
+	end
+
+	local order = Scanner.SEV
+	table.sort(rows, function(a, b)
+		local sa = order[a.finding.severity] or 0
+		local sb = order[b.finding.severity] or 0
+		if sa ~= sb then return sa > sb end
+		if a.path ~= b.path then return a.path < b.path end
+		return (a.finding.line or 0) < (b.finding.line or 0)
+	end)
+
+	return {
+		rows = rows, sites = sites, scanned = #list - #unreadable,
+		unreadable = unreadable, skipped = skipped,
+		sigs = sigs, scriptPaths = scriptPaths,
+		seconds = os.clock() - started, cancelled = cancelled,
+		selectionOnly = selectionOnly,
+	}
+end
+
+--------------------------------------------------------------------------------
+-- Render
+--------------------------------------------------------------------------------
+
+-- One TextButton per finding, two per finding with the detail on its own row,
+-- is a multi-second freeze at a few thousand findings - the same freeze the
+-- scan loop yields to avoid. So: detail goes in the SAME button behind a
+-- newline (half the instances), the loop yields, and the list is capped.
+local MAX_ROWS = 150
+
+-- The findings list was capped from the start. The diff list was not, and a
+-- 2,000-script place against a baseline taken from a different place drew
+-- 1,429 NEW rows before the findings - burying the actual report under a wall
+-- of red you cannot scroll past. Same failure the cap exists to prevent; I
+-- just never applied it to the block I added last.
+local MAX_DIFF_ROWS = 40
+
+-- The render loop yields, so a theme change can start a second render while
+-- the first is parked. LayoutOrder happens to survive that, but only because
+-- every reset is paired with a fresh list - an invariant nobody will remember.
+-- A generation counter makes the stale render exit instead.
+local renderGen = 0
+local nextOrder = 0
+
+local function clear()
+	for _, c in ipairs(widget:GetChildren()) do
+		c:Destroy()
+	end
+end
+
+local function beginRender(): (ScrollingFrame, number)
+	renderGen += 1
+	local mine = renderGen
+	clear()
+	nextOrder = 0
+
+	local bg = Instance.new("Frame")
+	bg.Size = UDim2.fromScale(1, 1)
+	bg.BackgroundColor3 = themeBack
+	bg.BorderSizePixel = 0
+	bg.Parent = widget
+
+	local list = Instance.new("ScrollingFrame")
+	list.Size = UDim2.fromScale(1, 1)
+	list.CanvasSize = UDim2.new()
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.ScrollBarThickness = 8
+	list.BackgroundTransparency = 1
+	list.BorderSizePixel = 0
+	list.Parent = bg
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 6)
+	pad.PaddingTop = UDim.new(0, 4)
+	pad.PaddingRight = UDim.new(0, 6)
+	pad.Parent = list
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 2)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = list
+
+	return list, mine
+end
+
+local function line(list: ScrollingFrame, text: string, colour: Color3?, inst: Instance?,
+		onClick: (() -> ())?): TextButton
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, -8, 0, 18)
+	b.AutomaticSize = Enum.AutomaticSize.Y
+	b.TextXAlignment = Enum.TextXAlignment.Left
+	b.TextYAlignment = Enum.TextYAlignment.Top
+	b.TextWrapped = true
+	b.RichText = false
+	b.Font = Enum.Font.Code
+	b.TextSize = 13
+	b.TextColor3 = colour or themeText
+	b.BackgroundColor3 = themeHover
+	b.BackgroundTransparency = 1
+	-- AutoButtonColor modulates BackgroundColor3, and there is nothing to
+	-- modulate at full transparency - a clickable row would look exactly like
+	-- a label. Do the hover by hand, and at full opacity: Studio's Item/Hover
+	-- colour is chosen to be visible against Studio's own background, so
+	-- fading it out is throwing away the only thing that makes it work.
+	b.AutoButtonColor = false
+	b.Text = text
+	nextOrder += 1
+	b.LayoutOrder = nextOrder
+	b.Parent = list
+	if inst or onClick then
+		b.MouseEnter:Connect(function() b.BackgroundTransparency = 0 end)
+		b.MouseLeave:Connect(function() b.BackgroundTransparency = 1 end)
+		b.MouseButton1Click:Connect(function()
+			if inst then Selection:Set({ inst }) end
+			if onClick then
+				local ok, err = pcall(onClick)
+				if not ok then warn("[Script Audit] " .. tostring(err)) end
+			end
+		end)
+	end
+	return b
+end
+
+-- What is currently on screen. Without this, a theme change repaints the
+-- "nothing selected" message as the previous scan's report, and repaints an
+-- error screen as the intro - losing the error with no trace on screen.
+type View = "intro" | "report" | "error" | "empty" | "busy"
+local currentView: View = "intro"
+local lastResult: Result? = nil
+local lastError: string? = nil
+
+local busyLabel: TextButton? = nil
+local busyNote: TextButton? = nil
+
+-- Rebuilding the whole widget on every progress tick is itself slow enough to
+-- change what it is reporting on. Build it once; move one label after that.
+local function renderBusy(done: number, total: number)
+	if not busyLabel then
+		currentView = "busy"
+		local list = beginRender()
+		busyLabel = line(list, "Scanning...")
+		busyNote = line(list, "Click the same toolbar button again to cancel.", themeDim)
+	end
+	local b = busyLabel
+	if b then
+		b.Text = (total > 0)
+			and ("Scanning... %d / %d scripts"):format(done, total)
+			or "Scanning..."
+	end
+end
+
+local function renderIntro()
+	currentView = "intro"
+	local list = beginRender()
+	line(list, "Script Audit")
+	line(list, "")
+	line(list, "Scan place - list every point in this place where code can be "
+		.. "loaded at runtime.", themeDim)
+	line(list, "Scan selection - the same, for whatever is selected in the "
+		.. "Explorer.", themeDim)
+	line(list, "")
+	line(list, "Coverage is the promise: every site gets a row.", themeDim)
+	line(list, "The severity ranking is best effort. It is not a verdict.", themeDim)
+end
+
+local function renderEmpty()
+	currentView = "empty"
+	local list = beginRender()
+	line(list, "Nothing is selected in the Explorer.", sevColour("high"))
+	line(list, "Select a folder or a script, then click Scan selection.", themeDim)
+end
+
+local function renderError(what: string)
+	currentView = "error"
+	lastError = what
+	local list = beginRender()
+	line(list, "The scan failed. Nothing here is a result.", sevColour("critical"))
+	line(list, what, themeDim)
+end
+
+-- Turn "Game.ServerScriptService.Runtime" back into the Instance, so a NEW or
+-- CHANGED row is clickable like every other row. Nil if it has been deleted
+-- since the scan, which is not an error.
+-- GetFullName does NOT include the DataModel, so "ServerScriptService.Runtime"
+-- walks straight down from `game`. A script whose own name contains a dot
+-- cannot be found this way; that is a limit of GetFullName, not of this, and
+-- it returns nil rather than guessing.
+local function findByPath(full: string): Instance?
+	local cur: Instance = game
+	for part in string.gmatch(full, "[^%.]+") do
+		local nxt = cur:FindFirstChild(part)
+		if not nxt then return nil end
+		cur = nxt
+	end
+	return (cur ~= game) and cur or nil
+end
+
+local function saveBaseline(res: Result)
+	local total = 0
+	for _ in pairs(res.sigs) do total += 1 end
+	local entries: { string } = {}
+	for p, v in pairs(res.sigs) do
+		if #entries >= BASELINE_MAX then break end
+		entries[#entries + 1] = ("%d|%s"):format(v, p)
+	end
+	local n = #entries
+	local store = { saved = os.date("!%Y-%m-%d %H:%M UTC"), entries = entries }
+	local ok, err = pcall(function()
+		plugin:SetSetting(BASELINE_KEY, store)
+	end)
+	if not ok then
+		warn("[Script Audit] could not save the baseline: " .. tostring(err))
+		return
+	end
+	if total > BASELINE_MAX then
+		warn(("[Script Audit] baseline capped at %d scripts of %d. The diff after "
+			.. "this WILL be incomplete."):format(BASELINE_MAX, total))
+	end
+	print(("[Script Audit] baseline saved: %d script(s) at %s")
+		:format(n, store.saved))
+end
+
+-- The report dies when the window closes, which is no use to anyone auditing a
+-- place they just bought. This writes it into the place as a ModuleScript so it
+-- can be read, saved with the file, and diffed in git through Rojo.
+local function exportReport(res: Result)
+	local lines = {
+		"--[[  Script Audit report",
+		"",
+		("  generated : %s"):format(os.date("!%Y-%m-%d %H:%M UTC")),
+		("  sites     : %d across %d script(s)"):format(res.sites, res.scanned),
+		("  findings  : %d"):format(#res.rows),
+	}
+	if #res.skipped > 0 then
+		lines[#lines + 1] = ("  not scanned: %s"):format(table.concat(res.skipped, ", "))
+	end
+	if #res.unreadable > 0 then
+		lines[#lines + 1] = ""
+		lines[#lines + 1] = ("  COULD NOT BE READ (%d) - coverage is incomplete:"):format(#res.unreadable)
+		for _, u in ipairs(res.unreadable) do lines[#lines + 1] = "    " .. u end
+	end
+	lines[#lines + 1] = ""
+	for _, r in ipairs(res.rows) do
+		local f = r.finding
+		lines[#lines + 1] = ("  [%s] %s:%s  %s"):format(
+			tostring(f.severity):upper(), r.path, tostring(f.line), tostring(f.rule))
+		lines[#lines + 1] = ("        %s"):format(tostring(f.detail))
+	end
+	lines[#lines + 1] = ""
+	lines[#lines + 1] = "  Coverage is the promise: every site above is listed."
+	lines[#lines + 1] = "  The ranking is best effort and is not a verdict."
+	lines[#lines + 1] = "]]"
+	lines[#lines + 1] = "return {}"
+
+	local okS, storage = pcall(function() return game:GetService("ServerStorage") end)
+	if not okS or not storage then
+		warn("[Script Audit] no ServerStorage to write into.")
+		return
+	end
+	-- Undoable. This is the only thing the plugin writes, and a read-only tool
+	-- that suddenly edits your place had better leave a waypoint.
+	pcall(function()
+		game:GetService("ChangeHistoryService"):SetWaypoint("Script Audit report")
+	end)
+	local m = Instance.new("ModuleScript")
+	m.Name = "ScriptAuditReport"
+	m.Source = table.concat(lines, "\n")
+	m.Parent = storage
+	pcall(function()
+		game:GetService("ChangeHistoryService"):SetWaypoint("Script Audit report written")
+	end)
+	Selection:Set({ m })
+	print("[Script Audit] report written to ServerStorage.ScriptAuditReport (Ctrl+Z undoes it)")
+end
+
+local function render(res: Result)
+	currentView = "report"
+	local list, mine = beginRender()
+
+	if res.cancelled then
+		line(list, "CANCELLED - the numbers below are partial.", sevColour("high"))
+	end
+
+	line(list, ("%d code-loading site(s) across %d script(s)%s."):format(
+		res.sites, res.scanned, res.selectionOnly and " in the selection" or ""))
+	line(list, ("Scanned in %.2fs. Every site is listed; ranking is best effort.")
+		:format(res.seconds), themeDim)
+	if #res.skipped > 0 then
+		-- Say what was not looked at. A coverage promise with a silent
+		-- exception list is not a coverage promise.
+		line(list, "Not scanned (Roblox's own, not part of your place): "
+			.. table.concat(res.skipped, ", "), themeDim)
+	end
+
+	-- WHAT CHANGED comes before WHAT IS THERE. A list of sites is the normal
+	-- state of any real place; a site that was not there last time is the
+	-- thing worth looking at, so it goes at the top.
+	local base, stamp = loadBaseline()
+	line(list, "")
+	if not base then
+		line(list, "No baseline saved yet - this scan is a list, not a diff.", themeDim)
+		line(list, "   [ save this scan as the baseline ]", themeText, nil, function()
+			saveBaseline(res)
+		end)
+	else
+		local added, changed, removed = {}, {}, {}
+		local addedQuiet = 0
+		local seen: { [string]: boolean } = {}
+		for _, p in ipairs(res.scriptPaths) do
+			seen[p] = true
+			local now, was = res.sigs[p], base[p]
+			if was == nil then
+				if (now or 0) ~= 0 then
+					added[#added + 1] = p
+				else
+					-- New, but loads no code. Counted so the total is honest,
+					-- not listed, because a place under development would drown
+					-- the real signal in ordinary new files.
+					addedQuiet += 1
+				end
+			elseif was ~= now then
+				changed[#changed + 1] = p
+			end
+		end
+		for p in pairs(base) do
+			if not seen[p] then removed[#removed + 1] = p end
+		end
+		table.sort(added); table.sort(changed); table.sort(removed)
+
+		if #added == 0 and #changed == 0 and #removed == 0 and addedQuiet == 0 then
+			line(list, "No change since the baseline" .. (stamp and (" saved " .. stamp) or "")
+				.. ".", themeDim)
+		else
+			line(list, ("SINCE THE BASELINE%s: %d new, %d changed, %d gone."):format(
+				stamp and (" saved " .. stamp) or "", #added, #changed, #removed),
+				sevColour("high"))
+			-- Draw at most MAX_DIFF_ROWS of each, say how many were left out,
+			-- and send the remainder to Output in batches. A diff you cannot
+			-- scroll past is not a diff.
+			local function block(label: string, paths: { string }, colour: Color3, clickable: boolean)
+				local shownD = math.min(#paths, MAX_DIFF_ROWS)
+				for i = 1, shownD do
+					local p = paths[i]
+					line(list, ("   %-8s %s"):format(label, p), colour,
+						clickable and findByPath(p) or nil)
+					if i % 50 == 0 then
+						task.wait()
+						if renderGen ~= mine then return false end
+					end
+				end
+				if shownD < #paths then
+					line(list, ("   ... and %d more %s - in the Output window"):format(
+						#paths - shownD, label), themeDim)
+					local buf: { string } = {}
+					for i = shownD + 1, #paths do
+						buf[#buf + 1] = ("  %-8s %s"):format(label, paths[i])
+						if #buf >= 25 then
+							print("[Script Audit]\n" .. table.concat(buf, "\n"))
+							buf = {}
+						end
+					end
+					if #buf > 0 then print("[Script Audit]\n" .. table.concat(buf, "\n")) end
+				end
+				return true
+			end
+
+			if not block("NEW", added, sevColour("critical"), true) then return end
+			if not block("CHANGED", changed, sevColour("high"), true) then return end
+			if not block("GONE", removed, themeDim, false) then return end
+			if addedQuiet > 0 then
+				line(list, ("   and %d new script(s) that load no code."):format(addedQuiet),
+					themeDim)
+			end
+		end
+		line(list, "   [ make this scan the new baseline ]", themeText, nil, function()
+			saveBaseline(res)
+		end)
+	end
+	line(list, "   [ write this report into ServerStorage ]", themeText, nil, function()
+		exportReport(res)
+	end)
+
+	if #res.unreadable > 0 then
+		line(list, "")
+		line(list, ("%d script(s) COULD NOT BE READ - coverage is incomplete:")
+			:format(#res.unreadable), sevColour("high"))
+		for _, n in ipairs(res.unreadable) do
+			line(list, "   " .. n, sevColour("high"))
+		end
+	end
+
+	line(list, "")
+
+	if #res.rows == 0 then
+		line(list, "Nothing was ranked. That is not the same as safe.", themeDim)
+		return
+	end
+
+	-- A severity the Scanner emits that this file does not know about must not
+	-- take the report down with it, and must not vanish from the count either.
+	local counts: { [string]: number } = {}
+	local unknownOrder: { string } = {}
+	for _, r in ipairs(res.rows) do
+		local s = tostring(r.finding.severity or "unknown")
+		if counts[s] == nil then
+			counts[s] = 0
+			if not IS_KNOWN_SEV[s] then unknownOrder[#unknownOrder + 1] = s end
+		end
+		counts[s] += 1
+	end
+	local summary = {}
+	for _, s in ipairs(KNOWN_SEV) do
+		if counts[s] then summary[#summary + 1] = ("%d %s"):format(counts[s], s) end
+	end
+	for _, s in ipairs(unknownOrder) do
+		summary[#summary + 1] = ("%d %s"):format(counts[s], s)
+	end
+	line(list, ("%d finding(s): %s"):format(#res.rows, table.concat(summary, ", ")))
+	line(list, "Click any row to select that script in the Explorer.", themeDim)
+	line(list, "")
+
+	local shown = math.min(#res.rows, MAX_ROWS)
+	for i = 1, shown do
+		local row = res.rows[i]
+		local f = row.finding
+		line(list, ("[%s] %s:%s  %s\n      %s"):format(
+			tostring(f.severity):upper(), row.path, tostring(f.line),
+			tostring(f.rule), tostring(f.detail)),
+			sevColour(f.severity), row.inst)
+		if i % 50 == 0 then
+			task.wait()
+			-- A newer render started while this one was parked. Stop drawing
+			-- into a list nobody can see.
+			if renderGen ~= mine then return end
+		end
+	end
+
+	if shown < #res.rows then
+		line(list, "")
+		line(list, ("Showing the top %d of %d findings. The other %d were "):format(
+			shown, #res.rows, #res.rows - shown)
+			.. "measured and are printed to the Output window - they are not "
+			.. "missing, just not drawn.", sevColour("high"))
+		-- One print per finding is what makes Output crawl; one print of two
+		-- hundred lines is a single unfilterable, unclickable blob. Small
+		-- batches keep both problems small.
+		local buf: { string } = {}
+		local function flush()
+			if #buf > 0 then
+				print("[Script Audit]\n" .. table.concat(buf, "\n"))
+				buf = {}
+			end
+		end
+		for i = shown + 1, #res.rows do
+			local row = res.rows[i]
+			local f = row.finding
+			buf[#buf + 1] = ("  [%s] %s:%s  %s - %s"):format(
+				tostring(f.severity):upper(), row.path, tostring(f.line),
+				tostring(f.rule), tostring(f.detail))
+			if #buf >= 25 then
+				flush()
+				task.wait()
+				if renderGen ~= mine then return end
+			end
+		end
+		flush()
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Wiring
+--------------------------------------------------------------------------------
+
+-- Assigned here rather than at the declaration so refreshTheme can repaint
+-- whatever is actually on screen when Studio's theme changes under it.
+rerender = function()
+	if scanning then return end
+	local ok, err = pcall(function()
+		if currentView == "report" and lastResult then
+			render(lastResult :: Result)
+		elseif currentView == "error" then
+			renderError(lastError or "unknown error")
+		elseif currentView == "empty" then
+			renderEmpty()
+		else
+			renderIntro()
+		end
+	end)
+	if not ok then warn("[Script Audit] repaint failed: " .. tostring(err)) end
+end
+
+local function run(selectionOnly: boolean)
+	if scanning then
+		if activeIsSelection == selectionOnly then
+			-- Same button twice means cancel.
+			cancelRequested = true
+		else
+			-- The OTHER button. Cancelling the running scan here would look
+			-- like the click did something random, so refuse it - and say so
+			-- in the window, because the user is looking at the window and not
+			-- at the Output panel.
+			local n = busyNote
+			if n then
+				n.Text = "A scan is already running. Let it finish, or click "
+					.. "the same button again to cancel it."
+				n.TextColor3 = sevColour("high")
+			end
+			warn("[Script Audit] a scan is already running - let it finish, or "
+				.. "click the same button again to cancel it.")
+		end
+		return
+	end
+
+	widget.Enabled = true
+
+	if selectionOnly and #Selection:Get() == 0 then
+		renderEmpty()
+		return
+	end
+
+	busyLabel = nil
+	busyNote = nil
+	cancelRequested = false
+	-- renderBusy touches the widget and is not inside the pcall below, so the
+	-- flag goes up only once we are certain we will reach the reset.
+	local okBusy, busyErr = pcall(renderBusy, 0, 0)
+	if not okBusy then
+		warn("[Script Audit] " .. tostring(busyErr))
+		return
+	end
+
+	scanning = true
+	activeIsSelection = selectionOnly
+	local ok, res = pcall(scan, selectionOnly, renderBusy)
+	busyLabel = nil
+	busyNote = nil
+	scanning = false
+	activeIsSelection = nil
+	cancelRequested = false
+
+	if not ok then
+		warn("[Script Audit] " .. tostring(res))
+		lastResult = nil
+		renderError(tostring(res))
+		return
+	end
+
+	lastResult = res :: Result
+	local okR, errR = pcall(render, res :: Result)
+	if not okR then
+		warn("[Script Audit] render failed: " .. tostring(errR))
+		lastResult = nil
+		renderError(tostring(errR))
+	end
+end
+
+local function syncShowButton()
+	buttonShow:SetActive(widget.Enabled)
+end
+
+buttonShow.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+	syncShowButton()
+end)
+buttonPlace.Click:Connect(function()
+	buttonPlace:SetActive(false)
+	run(false)
+end)
+buttonSelection.Click:Connect(function()
+	buttonSelection:SetActive(false)
+	run(true)
+end)
+
+widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+	syncShowButton()
+	if widget.Enabled then
+		-- Reopening during a scan means "I want to watch it again", not
+		-- "cancel it" - so undo the cancel the close set.
+		if scanning then cancelRequested = false end
+	elseif scanning then
+		-- Closing mid-scan stops the work rather than grinding through a few
+		-- thousand scripts nobody is going to look at.
+		cancelRequested = true
+	end
+end)
+
+local themeConn: RBXScriptConnection? = nil
+pcall(function()
+	themeConn = settings().Studio.ThemeChanged:Connect(refreshTheme)
+end)
+
+-- Reloading the .rbxmx while iterating runs this file again without unloading
+-- the old one, so without this every reload stacks another live refreshTheme
+-- and leaves a ghost dock window behind.
+plugin.Unloading:Connect(function()
+	if themeConn then themeConn:Disconnect() end
+	rerender = nil
+	pcall(function() widget:Destroy() end)
+end)
+
+refreshTheme()
+renderIntro()
+syncShowButton()
+
+]]></ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX2">
+      <Properties>
+        <string name="Name">Scanner</string>
+        <ProtectedString name="Source"><![CDATA[
+-- Scanner.lua  v2 - value tracking, not name matching.
+--
+-- WHY v2 EXISTS (read this before changing anything)
+--   v1 scored 1.000 precision and 1.000 recall against a corpus I wrote
+--   myself. An independent adversary then ran 60 scripts through it and got
+--   RECALL 0.31 and PRECISION 0.25 on realistic code.
+--
+--   The corpus had tested the allowlist against itself. Its three legitimate
+--   require() calls all began with the literal token `script` or
+--   `ReplicatedStorage`, which were two of the nine strings in the allowlist.
+--   No folder loop, no Knit layout, no `local RS = game:GetService(...)`.
+--   Meanwhile every malicious sample called through a bare `NAME(`.
+--   Corpus and implementation shared one mental model, so the score measured
+--   self-consistency and nothing else.
+--
+--   The two structural faults were:
+--     1. pass 1 matched ONE syntactic shape for assignment, pass 2 gated on
+--        ONE syntactic shape for calls. `local foo = (require)` - two extra
+--        characters - defeated the entire product.
+--     2. `require(<anything not in the allowlist>)` was scored HIGH, which is
+--        how most professional Roblox code is written. 12 of 15 false
+--        positives came from that one rule.
+--
+--   v2 tracks VALUES through a tiny lattice instead of matching names, and
+--   `require-dynamic` is now informational. Each new bypass used to need its
+--   own special case, and the special cases were what generated the false
+--   positives.
+--
+-- STILL NOT A THEOREM PROVER
+--   No dataflow across functions, no loops, no scope analysis. Known misses
+--   are listed in KNOWN_MISSES at the bottom and in the README. The claim
+--   this can defend is a measured number against a NAMED corpus, half of
+--   which somebody else wrote.
+
+local Scanner = {}
+local Lexer = _G.__ROBLOX and require(script.Parent.Lexer) or require("Lexer")
+
+local DANGEROUS = { require = "require", loadstring = "loadstring",
+	getfenv = "getfenv", setfenv = "setfenv" }
+
+-- Words nobody assembles at runtime by accident.
+local ALARM_WORD = { require = true, loadstring = true, getfenv = true,
+	setfenv = true, HttpService = true, HttpGet = true, PostAsync = true }
+
+local HTTP_CALL = { PostAsync = true, GetAsync = true, RequestAsync = true }
+
+-- Calls whose RESULT is the function you passed in, rather than its return.
+local WRAPPERS = { ["coroutine.wrap"] = true, ["coroutine.create"] = true }
+
+local SEV = { critical = 4, high = 3, medium = 2, low = 1 }
+
+local function V(kind, t) t = t or {}; t.kind = kind; return t end
+local UNKNOWN = function(hidden) return V("unknown", { hidden = hidden }) end
+
+---------------------------------------------------------------------------
+-- token helpers
+---------------------------------------------------------------------------
+-- Block extents: opener index -> index of its matching `end`/`until`.
+-- WHY THIS EXISTS: without it `vars` was one flat, file-global, last-write-wins
+-- map, and a second adversary turned the entire product off with one inert
+-- line - `local require = t.require` inside a helper that is never called
+-- rebound the name for the WHOLE FILE, including calls forty lines above it.
+-- A scanner with a one-line off switch has whatever recall the attacker picks.
+local function buildBlocks(tk)
+	local ends, stack = {}, {}
+	local pendingDo = 0
+	for i = 1, #tk do
+		local t = tk[i]
+		if t.type == "keyword" then
+			local v = t.value
+			if v == "for" or v == "while" then
+				pendingDo = pendingDo + 1
+				stack[#stack + 1] = i
+			elseif v == "do" then
+				if pendingDo > 0 then pendingDo = pendingDo - 1
+				else stack[#stack + 1] = i end
+			elseif v == "function" or v == "if" or v == "repeat" then
+				stack[#stack + 1] = i
+			elseif v == "end" or v == "until" then
+				local open = stack[#stack]
+				if open then ends[open] = i; stack[#stack] = nil end
+			end
+		end
+	end
+	for _, open in ipairs(stack) do ends[open] = #tk end
+	return ends
+end
+
+-- Precompute every bracket pair in one linear scan. The scanning version
+-- below was O(n) per lookup and pass 2 looks up at every "(", which made a
+-- deeply-nested 8KB file take four seconds. A place file has thousands of
+-- scripts; four seconds each is not a product.
+local function buildPairs(tk)
+	local pairsMap, stack = {}, {}
+	for i = 1, #tk do
+		local v = tk[i].value
+		if v == "(" or v == "{" or v == "[" then
+			stack[#stack + 1] = i
+		elseif v == ")" or v == "}" or v == "]" then
+			local open = stack[#stack]
+			if open then
+				local ov = tk[open].value
+				local want = (ov == "(" and ")") or (ov == "{" and "}") or "]"
+				if want == v then
+					pairsMap[open] = i
+					stack[#stack] = nil
+				end
+			end
+		end
+	end
+	return pairsMap
+end
+
+local function matchCloseSlow(tk, i)
+	-- tk[i] is an opener; return index of its matching closer
+	local open = tk[i].value
+	local close = (open == "(" and ")") or (open == "{" and "}") or "]"
+	local depth, j = 0, i
+	while tk[j] do
+		local v = tk[j].value
+		if v == open then depth = depth + 1
+		elseif v == close then
+			depth = depth - 1
+			if depth == 0 then return j end
+		end
+		j = j + 1
+	end
+	return nil
+end
+
+local function isEscapedLiteral(tok)
+	local raw = tok.raw or ""
+	return raw:match("\\%d") ~= nil or raw:match("\\x%x%x") ~= nil
+		or raw:match("\\u{") ~= nil
+end
+
+---------------------------------------------------------------------------
+-- the analyser
+---------------------------------------------------------------------------
+function Scanner.analyse(source, sourceName)
+	local tk = Lexer.tokenize(source)
+	local PAIRS = buildPairs(tk)
+	local BLOCK_END = buildBlocks(tk)
+	local function matchClose(_, i)
+		return PAIRS[i] or matchCloseSlow(tk, i)
+	end
+	local findings, seen = {}, {}
+	-- name -> list of { from, to, value }. A binding is only visible between
+	-- the token where it appears and the end of the block that contains it.
+	local bindings = {}
+	local blockStack = {}    -- indices of currently-open blocks, during pass 1
+
+	local function currentBlockEnd()
+		local open = blockStack[#blockStack]
+		return open and (BLOCK_END[open] or #tk) or #tk
+	end
+
+	-- isLocal=false means a plain assignment `x = ...`, which rebinds whatever
+	-- x already was rather than creating a block-scoped name. Getting this
+	-- wrong made `out = out .. c` inside a for-loop invisible outside it.
+	local function bind(name, value, at, isLocal)
+		if not name then return end
+		local list = bindings[name]
+		if not list then list = {}; bindings[name] = list end
+		local extent = currentBlockEnd()
+		if not isLocal then
+			local outer
+			for _, b in ipairs(list) do
+				if b.from <= at and (not outer or b.to > outer.to) then outer = b end
+			end
+			extent = outer and outer.to or #tk
+		end
+		list[#list + 1] = { from = at, to = extent, value = value }
+	end
+
+	local function lookup(name, at)
+		local list = bindings[name]
+		if not list then return nil end
+		local best
+		for _, b in ipairs(list) do
+			if b.from <= at and at <= b.to then
+				if not best or b.from > best.from then best = b end
+			end
+		end
+		return best and best.value or nil
+	end
+
+	-- _G and shared are deliberately NOT here. In Roblox `_G` is an initially
+	-- empty table shared between scripts - it is NOT the script environment,
+	-- and `_G.require` is nil, so `_G["require"](id)` raises "attempt to call a
+	-- nil value" on a real server. v2 scored two "true positives" on backdoors
+	-- that do not work, and paid for them with the single worst false positive
+	-- in the product: `_G[player.UserId] = data`, which is ordinary beginner
+	-- code, was reported as "there is no ordinary reason to do this".
+	-- getfenv() is the real environment table and is still handled.
+	local envTables = {}
+	-- field name -> danger root, for `L.fn = require` then `self.fn(id)`.
+	-- Deliberately file-local and only consulted for `self.` calls, so it
+	-- cannot turn an unrelated table field into a false positive.
+	local dangerFields = {}
+	local renamedFields = {}
+
+	local function add(sev, rule, line, detail)
+		local k = rule .. ":" .. tostring(line)
+		if seen[k] then return end
+		seen[k] = true
+		findings[#findings + 1] = { severity = sev, rule = rule,
+			line = line, detail = detail }
+	end
+
+	local evalExpr, consumeCall  -- forward
+
+	-- A name that resolves to a function is only THAT function while it is
+	-- not being called. `local Config = require(script.Parent.Config)` binds
+	-- Config to the module require RETURNS, not to require itself. v2 got this
+	-- wrong on its first run and decided an ordinary module loader was passing
+	-- require around as a value.
+	consumeCall = function(v, after, depth)
+		if not tk[after] then return v, after end
+		local calling = tk[after].value == "(" or tk[after].type == "string"
+		if not calling then return v, after end
+		if v.kind ~= "danger" and v.kind ~= "factory" and v.kind ~= "env" then
+			return v, after
+		end
+		local close = (tk[after].value == "(") and matchClose(tk, after) or after
+		local nxt = (close or after) + 1
+		if v.kind == "factory" then
+			return V("danger", { root = v.root }), nxt
+		end
+		if v.kind == "env" then return V("env", {}), nxt end
+		-- getfenv() hands back the environment table itself. Returning
+		-- "unknown" here lost `local a = getfenv()` and every index off it.
+		if v.root == "getfenv" or v.root == "setfenv" then
+			return V("env", {}), nxt
+		end
+		-- calling require/loadstring yields whatever it loaded: unknown.
+		return UNKNOWN(false), nxt
+	end
+
+	-- name / name.field / name:method / name["field"] / game:GetService("X")
+	local function readChain(i)
+		local t = tk[i]
+		if not t or t.type ~= "name" then return nil, i end
+		local parts, j = { t.value }, i + 1
+		while tk[j] do
+			local a = tk[j]
+			if (a.value == "." or a.value == ":") and tk[j + 1]
+				and (tk[j + 1].type == "name" or tk[j + 1].type == "keyword") then
+				parts[#parts + 1] = tk[j + 1].value; j = j + 2
+			elseif a.value == "[" and tk[j + 1] and tk[j + 1].type == "string"
+				and tk[j + 2] and tk[j + 2].value == "]" then
+				parts[#parts + 1] = tk[j + 1].value; j = j + 3
+			elseif a.value == "[" and tk[j + 1] and tk[j + 1].type == "number"
+				and tk[j + 2] and tk[j + 2].value == "]" then
+				parts[#parts + 1] = tk[j + 1].value; j = j + 3
+			elseif a.value == "(" and parts[#parts] == "GetService"
+				and tk[j + 1] and tk[j + 1].type == "string"
+				and tk[j + 2] and tk[j + 2].value == ")" then
+				parts[#parts] = tk[j + 1].value; j = j + 3
+			else break end
+		end
+		return table.concat(parts, "."), j
+	end
+
+	-- string.char(114,101,...) with simple arithmetic allowed, so that
+	-- string.char(113+1, ...) is not a bypass.
+	local function decodeCharCall(i)
+		local chain, after = readChain(i)
+		if chain ~= "string.char" and chain ~= "utf8.char" then return nil end
+		if not tk[after] or tk[after].value ~= "(" then return nil end
+		local close = matchClose(tk, after)
+		if not close then return nil end
+		local out, j = {}, after + 1
+		while j < close do
+			local acc, sawNum = nil, false
+			while j < close and tk[j].value ~= "," do
+				local t = tk[j]
+				if t.type == "number" then
+					local n = tonumber(t.value)
+					if not n then return nil end
+					if acc == nil then acc = n; sawNum = true
+					else return nil end
+					j = j + 1
+					-- fold  N + M  /  N - M
+					while j < close and (tk[j].value == "+" or tk[j].value == "-")
+						and tk[j + 1] and tk[j + 1].type == "number" do
+						local m = tonumber(tk[j + 1].value)
+						acc = tk[j].value == "+" and (acc + m) or (acc - m)
+						j = j + 2
+					end
+				else
+					return nil
+				end
+			end
+			if not sawNum or acc < 0 or acc > 255 then return nil end
+			out[#out + 1] = string.char(math.floor(acc))
+			if j < close then j = j + 1 end
+		end
+		if #out == 0 then return nil end
+		return table.concat(out), close + 1
+	end
+
+	-- table.concat{"req","uire"} / table.concat({...})
+	local function decodeTableConcat(i)
+		local chain, after = readChain(i)
+		if chain ~= "table.concat" then return nil end
+		local openIdx = after
+		if tk[openIdx] and tk[openIdx].value == "(" then openIdx = openIdx + 1 end
+		if not tk[openIdx] or tk[openIdx].value ~= "{" then return nil end
+		local close = matchClose(tk, openIdx)
+		if not close then return nil end
+		local out, j = {}, openIdx + 1
+		while j < close do
+			if tk[j].type == "string" then out[#out + 1] = tk[j].value
+			elseif tk[j].value ~= "," then return nil end
+			j = j + 1
+		end
+		if #out == 0 then return nil end
+		local fin = close + 1
+		if tk[fin] and tk[fin].value == ")" then fin = fin + 1 end
+		return table.concat(out), fin
+	end
+
+	-- require(tonumber(x)) is require-by-asset-id with one wrapper on it. The
+	-- realistic backdoor puts the indirection on the ID, not on `require` -
+	-- an HTTP-fetched manifest, tonumber, require. v2 scored that `low` and
+	-- printed "Normal in framework code" next to a remote-controlled loader.
+	local function isNumberProducer(i)
+		local chain = readChain(i)
+		return chain == "tonumber" or chain == "math.floor"
+			or chain == "math.tointeger"
+	end
+
+	local function decodeReverse(i)
+		local chain, after = readChain(i)
+		if chain ~= "string.reverse" then return nil end
+		if not (tk[after] and tk[after].value == "(" and tk[after + 1]
+			and tk[after + 1].type == "string" and tk[after + 2]
+			and tk[after + 2].value == ")") then return nil end
+		return tk[after + 1].value:reverse(), after + 3
+	end
+
+	-- Is this expression an environment table we can index for a real function?
+	local function envValueAt(i)
+		local chain, after = readChain(i)
+		if not chain then return nil, i end
+		if envTables[chain] and not lookup(chain, i) then return "env", after end
+		if chain == "getfenv" or chain == "setfenv" then
+			if tk[after] and tk[after].value == "(" then
+				local c = matchClose(tk, after)
+				if c then return "env", c + 1 end
+			end
+			return "env", after
+		end
+		local v = lookup(chain, i)
+		if v and v.kind == "env" then return "env", after end
+		return nil, i
+	end
+
+	-- Evaluate the expression starting at i. Returns value, indexAfter.
+	-- raw=true: resolve the name but DO NOT swallow the call after it. Pass 2
+	-- needs the callee sitting right before its own "(" so it can inspect the
+	-- arguments; every other caller wants the call's result.
+	-- Anything run through `..` with a non-literal, or through a method call
+	-- like ("x"):gsub(...), is a string we cannot read from the source. Saying
+	-- "unknown, and deliberately hidden" is both true and more useful than
+	-- pretending it is still the literal we started from - two holdout misses
+	-- (a string.byte loop and a gsub decode) came from keeping the literal.
+	local function degrade(v, after)
+		if not tk[after] then return v, after end
+		if tk[after].value == ".." then
+			local j = after
+			while tk[j] and tk[j].value ~= "\n" and (tk[j].value == ".."
+				or tk[j].type == "string" or tk[j].type == "name"
+				or tk[j].type == "number") do j = j + 1 end
+			-- hidden = FALSE. Joining two literals is how you wrap a long URL
+			-- at the 100-column mark; calling it hiding flagged an ordinary
+			-- analytics module. The env-index rule still catches the malicious
+			-- use, because there the result is used as a lookup key.
+			return UNKNOWN(false), j
+		end
+		if tk[after].value == ":" and tk[after + 1]
+			and tk[after + 1].type == "name" and tk[after + 2]
+			and tk[after + 2].value == "(" then
+			local c = matchClose(tk, after + 2)
+			return UNKNOWN(true), (c or after + 2) + 1
+		end
+		return v, after
+	end
+
+	evalExpr = function(i, depth, raw)
+		depth = (depth or 0) + 1
+		if depth > 12 or not tk[i] then return UNKNOWN(false), i end
+		local t = tk[i]
+
+		-- ( expr )  - v1 died here. Two characters.
+		if t.value == "(" then
+			local close = matchClose(tk, i)
+			if close then
+				local inner = evalExpr(i + 1, depth)
+				return degrade(inner, close + 1)
+			end
+		end
+
+		if t.type == "number" then
+			return V("number", { value = tonumber(t.value), raw = t.value }), i + 1
+		end
+
+		if t.type == "string" then
+			local v = V("string", { value = t.value,
+				hidden = isEscapedLiteral(t) })
+			local j = i + 1
+			-- literal .. literal chains
+			while tk[j] and tk[j].value == ".." and tk[j + 1] do
+				local rhs, after = evalExpr(j + 1, depth)
+				if rhs.kind == "string" then
+					v = V("string", { value = v.value .. rhs.value,
+						hidden = v.hidden or rhs.hidden, joined = true })
+					j = after
+				else
+					return UNKNOWN(v.hidden), after
+				end
+			end
+			return v, j
+		end
+
+		if t.type == "name" then
+			local s, after = decodeCharCall(i)
+			if s then return V("string", { value = s, hidden = true }), after end
+			s, after = decodeTableConcat(i)
+			if s then return V("string", { value = s, hidden = true }), after end
+			s, after = decodeReverse(i)
+			if s then return V("string", { value = s, hidden = true }), after end
+
+			-- Resolve the chain FIRST, so an explicit assignment always wins
+			-- over the built-in meaning. Frameworks really do publish their own
+			-- loader as `shared.require`, and treating that as the real thing
+			-- was a false positive.
+			local chain0, after0 = readChain(i)
+			if chain0 then
+				local v0 = lookup(chain0, i)
+				-- an env-valued variable falls through to the env-index logic
+				-- below; returning it here lost `local a = getfenv()` followed
+				-- by `a[<computed>]`.
+				if v0 and not (v0.kind == "env" and tk[after0]
+					and tk[after0].value == "[") then
+					if raw then return v0, after0 end
+					local cv, ca = consumeCall(v0, after0, depth)
+					return degrade(cv, ca)
+				end
+				-- getfenv()[...] is environment indexing, not a call to getfenv.
+				-- Letting DANGEROUS short-circuit here reported a bland
+				-- "low getfenv" and never looked at the index - five holdout
+				-- misses in a row, all the same cause.
+				local envish = (chain0 == "getfenv" or chain0 == "setfenv")
+					and tk[after0] and tk[after0].value == "("
+				if envish then
+					local c = matchClose(tk, after0)
+					if not (c and tk[c + 1] and (tk[c + 1].value == "["
+						or tk[c + 1].value == ".")) then envish = false end
+				end
+				if DANGEROUS[chain0] and not envish then
+					local dv = V("danger", { root = DANGEROUS[chain0] })
+					if raw then return dv, after0 end
+					return consumeCall(dv, after0, depth)
+				end
+				-- _G["require"] / shared.loadstring / <envvar>.require
+				local head, tail = chain0:match("^([%w_]+)%.(.+)$")
+				if head and tail and DANGEROUS[tail] then
+					local hv = lookup(head, i)
+					if (envTables[head] and not lookup(head, i))
+						or (hv and hv.kind == "env") then
+						add("high", "env-index", t.line, string.format(
+							"%s reaches %s through the environment table instead of "
+							.. "naming it - a plain text search does not find this",
+							chain0, tail))
+						local dv = V("danger", { root = DANGEROUS[tail] })
+						if raw then return dv, after0 end
+						return consumeCall(dv, after0, depth)
+					end
+				end
+			end
+
+			local env, afterEnv = envValueAt(i)
+			if env then
+				-- env [ expr ]  or  env . name
+				if tk[afterEnv] and tk[afterEnv].value == "[" then
+					local close = matchClose(tk, afterEnv)
+					local key = evalExpr(afterEnv + 1, depth)
+					local nxt = (close or afterEnv) + 1
+					if key.kind == "string" and DANGEROUS[key.value] then
+						add("high", "env-index",
+							t.line, string.format(
+							"the environment table is indexed with %q to reach a "
+							.. "function without ever naming it", key.value))
+						return V("danger", { root = DANGEROUS[key.value] }), nxt
+					end
+					if key.kind ~= "string" then
+						add("high", "env-dynamic-index", t.line,
+							"the environment table is indexed with a value computed "
+							.. "at runtime, so which function is called cannot be "
+							.. "read from the source. There is no ordinary reason "
+							.. "to do this.")
+						return UNKNOWN(true), nxt
+					end
+					return UNKNOWN(true), nxt
+				end
+				local chain, afterChain = readChain(i)
+				local tail = chain and chain:match("%.([%w_]+)$")
+				if tail and DANGEROUS[tail] and not lookup(chain, i) then
+					return V("danger", { root = DANGEROUS[tail] }), afterChain
+				end
+				return V("env", {}), afterEnv
+			end
+
+			local chain, afterChain = readChain(i)
+			if chain then
+				if chain:match("HttpService$") then
+					return V("http", {}), afterChain
+				end
+				-- setmetatable({}, {__index = getfenv()}) behaves as the env
+				if chain == "setmetatable" and tk[afterChain]
+					and tk[afterChain].value == "(" then
+					local close = matchClose(tk, afterChain)
+					if close then
+						local src = ""
+						for k = afterChain, close do src = src .. tk[k].value .. " " end
+						if src:match("getfenv") or src:match("_G") then
+							return V("env", {}), close + 1
+						end
+					end
+				end
+				return UNKNOWN(false), afterChain
+			end
+		end
+
+		if t.value == "{" then
+			local close = matchClose(tk, i)
+			return V("table", { open = i, close = close }), (close or i) + 1
+		end
+
+		return UNKNOWN(false), i + 1
+	end
+
+	---------------------------------------------------------------------
+	-- record what a name holds
+	---------------------------------------------------------------------
+	local function noteString(name, v, line)
+		if v.kind ~= "string" then return end
+		if ALARM_WORD[v.value] then
+			local built = v.hidden or v.joined
+			add(built and "critical" or "low",
+				built and "assembled-name" or "literal-name", line,
+				string.format("%s is set to %q%s", name, v.value,
+					built and " - spelled out at runtime from character codes, "
+						.. "concatenation or escapes rather than simply written. "
+						.. "Nothing does that by accident."
+					or ""))
+		end
+	end
+
+	-- table constructor fields:  { load = require }  /  { require }
+	local function recordTableFields(prefix, openIdx)
+		local close = matchClose(tk, openIdx)
+		if not close then return end
+		local j, arrayIdx = openIdx + 1, 1
+		while j < close do
+			if tk[j].type == "name" and tk[j + 1] and tk[j + 1].value == "=" then
+				local key = tk[j].value
+				local v, after = evalExpr(j + 2, 0)
+				bind(prefix .. "." .. key, v, j, false)
+				noteString(prefix .. "." .. key, v, tk[j].line)
+				j = after
+			elseif tk[j].value == "," then
+				j = j + 1
+			else
+				local v, after = evalExpr(j, 0)
+				if v.kind ~= "unknown" then
+					bind(prefix .. "." .. tostring(arrayIdx), v, j, false)
+				end
+				arrayIdx = arrayIdx + 1
+				j = (after > j) and after or (j + 1)
+			end
+		end
+	end
+
+	---------------------------------------------------------------------
+	-- PASS 1 - assignments and simple factory functions
+	---------------------------------------------------------------------
+	local i = 1
+	while tk[i] do
+		local t = tk[i]
+		if t.type == "keyword" then
+			local v = t.value
+			if v == "function" or v == "if" or v == "repeat" or v == "for"
+				or v == "while" or v == "do" then
+				if BLOCK_END[i] then blockStack[#blockStack + 1] = i end
+			elseif v == "end" or v == "until" then
+				blockStack[#blockStack] = nil
+			end
+		end
+
+		-- local function f() return require end
+		if t.type == "keyword" and t.value == "function"
+			or (t.type == "keyword" and t.value == "local"
+				and tk[i + 1] and tk[i + 1].value == "function") then
+			local nameIdx = (t.value == "local") and i + 2 or i + 1
+			local fname = readChain(nameIdx)
+			local j = nameIdx
+			local guard = 0
+			while tk[j] and guard < 4000 do
+				if tk[j].type == "keyword" and tk[j].value == "return" then
+					local v = evalExpr(j + 1, 0)
+					if v.kind == "danger" and fname then
+						bind(fname, V("factory", { root = v.root }), j, true)
+					end
+					break
+				end
+				if tk[j].type == "keyword" and tk[j].value == "end" then break end
+				j = j + 1; guard = guard + 1
+			end
+		end
+
+		local start = i
+		local isLocalDecl = false
+		if t.type == "keyword" and t.value == "local" then
+			start = i + 1; isLocalDecl = true
+		end
+		if tk[start] and tk[start].type == "name" then
+			-- gather lhs list:  a, b, c =
+			local names, j = {}, start
+			while tk[j] and tk[j].type == "name" do
+				-- `local loader: any = require` - readChain would fold ":any"
+				-- into the name and bind "loader.any", leaving `loader` unknown.
+				-- Every type-annotated local was invisible, which means a
+				-- --!strict codebase defeated the alias tracker by accident.
+				local chain, after
+				if tk[j + 1] and tk[j + 1].value == ":" and start == i + 1 then
+					chain = tk[j].value
+					after = j + 1
+					local depth = 0
+					while tk[after] and not (depth == 0
+						and (tk[after].value == "=" or tk[after].value == ","
+							or tk[after].type == "keyword")) do
+						local vv = tk[after].value
+						if vv == "(" or vv == "{" or vv == "<" then depth = depth + 1 end
+						if vv == ")" or vv == "}" or vv == ">" then depth = depth - 1 end
+						after = after + 1
+					end
+				else
+					chain, after = readChain(j)
+				end
+				names[#names + 1] = chain
+				j = after
+				if tk[j] and tk[j].value == "," then j = j + 1 else break end
+			end
+			if tk[j] and tk[j].value == "=" and tk[j + 1]
+				and tk[j + 1].value ~= "=" then
+				local r, n = j + 1, 1
+				while tk[r] and n <= #names do
+					if tk[r].value == "{" then
+						recordTableFields(names[n], r)
+						bind(names[n], V("table", {}), r, isLocalDecl)
+						local c = matchClose(tk, r)
+						r = (c or r) + 1
+					else
+						local v, after = evalExpr(r, 0)
+						bind(names[n], v, r, isLocalDecl)
+						noteString(names[n], v, tk[r].line)
+						if v.kind == "danger" then
+							local fld = names[n]:match("%.([%w_]+)$")
+							if fld then
+								dangerFields[fld] = v.root
+								if fld ~= v.root then
+									-- renamed on the way in. `Cache.require =
+									-- require` keeps the name and is a normal
+									-- injectable loader; `L.fn = require` hides it.
+									renamedFields[fld] = v.root
+									add("medium", "renamed-alias", tk[r].line,
+										string.format("%s is set to %s - the same "
+											.. "function under a different name, "
+											.. "which a text search will not find",
+											names[n], v.root))
+								end
+							end
+						end
+						r = after
+					end
+					if tk[r] and tk[r].value == "," then r = r + 1 else break end
+					n = n + 1
+				end
+				i = j
+			end
+		end
+		i = i + 1
+	end
+
+	---------------------------------------------------------------------
+	-- PASS 2 - calls, in any syntactic form
+	---------------------------------------------------------------------
+	local function argValues(openIdx)
+		local out = {}
+		if not tk[openIdx] then return out end
+		if tk[openIdx].type == "string" then
+			out[1] = V("string", { value = tk[openIdx].value,
+				hidden = isEscapedLiteral(tk[openIdx]) })
+			return out
+		end
+		if tk[openIdx].value ~= "(" then return out end
+		local close = matchClose(tk, openIdx)
+		if not close then return out end
+		local j = openIdx + 1
+		local guard = 0
+		while j < close and guard < 500 do
+			local v, after = evalExpr(j, 0)
+			out[#out + 1] = v
+			j = (after > j) and after or (j + 1)
+			while j < close and tk[j].value ~= "," do j = j + 1 end
+			if j < close then j = j + 1 end
+			guard = guard + 1
+		end
+		return out
+	end
+
+	local SAFE_ROOT = { script = true, game = true, workspace = true,
+		Instance = true }
+
+	i = 1
+	local guard = 0
+	while tk[i] and guard < 200000 do
+		guard = guard + 1
+		local t = tk[i]
+		if t.type ~= "name" and t.value ~= "(" then i = i + 1
+		elseif true then
+			local callee, after = evalExpr(i, 0, true)
+			if after <= i then i = i + 1
+			else
+				-- ALWAYS advance by one token at the end of this branch, never
+				-- to `after`. Jumping to `after` skipped the whole body of
+				-- `register(function() ... pcall(require, id) ... end)` - the
+				-- single most realistic backdoor in the holdout set walked
+				-- straight through because the paren group was stepped over.
+				-- `function bootstrap(require, root)` is a DECLARATION. Scoring
+				-- the parameter list as an argument list reported "require is
+				-- passed as a value to bootstrap" on the definition line, and
+				-- reported `critical loadstring` on a function that merely
+				-- returns a local of that name.
+				-- Walk back over the whole dotted/colon name, because pass 2
+				-- visits every token: for `function M.withLoader(require)` it
+				-- lands on `withLoader`, whose previous token is `.`, and only
+				-- `M` sits directly after `function`. Checking one or two
+				-- tokens back reported the DECLARATION as a call.
+				local b = i - 1
+				while tk[b] and (tk[b].value == "." or tk[b].value == ":"
+					or tk[b].type == "name") do b = b - 1 end
+				local isDecl = tk[b] and tk[b].type == "keyword"
+					and tk[b].value == "function"
+				local isCall = (not isDecl) and tk[after]
+					and (tk[after].value == "("
+						or tk[after].type == "string")
+				-- Do NOT jump to `after` here. The outer loop already advances
+				-- one token, so setting i = after skipped exactly one token -
+				-- and in `local foo = require` / `foo(id)` the token skipped
+				-- was `foo`. Recall fell from 0.83 to 0.67 on that one line.
+				if not isCall then -- fall through; outer loop advances by one
+				else
+					local args = argValues(after)
+					local a1 = args[1]
+					local _ = a1
+					local line = t.line
+
+					-- a dangerous function passed as a VALUE:  pcall(require, id)
+					local passedDanger, numberArg
+					for _, a in ipairs(args) do
+						if a.kind == "danger" then passedDanger = a.root end
+						if a.kind == "number" then numberArg = a.value end
+					end
+					if passedDanger then
+						local chain = readChain(i)
+						if numberArg then
+							add("critical", "danger-as-argument", line,
+								string.format("%s is handed to %s together with the "
+									.. "number %s - the call is made for it, so the "
+									.. "text \"%s(\" never appears",
+									passedDanger, tostring(chain or "a call"),
+									tostring(numberArg), passedDanger))
+						else
+							-- `pcall(require, child)` / `xpcall(require, h, m)` /
+							-- `task.spawn(require, m)` is how everyone writes
+							-- fault-tolerant module loading. Only the version
+							-- carrying an asset id is worth waking someone for.
+							-- pcall/xpcall/task.* with a module Instance is the
+							-- ordinary defensive-require idiom -> low.
+							-- Handing it to a plain local function is not: that
+							-- function is a trampoline whose only job is to make
+							-- the call somewhere the text search is not looking.
+							local ch2 = readChain(i) or ""
+							local ordinary = ch2 == "pcall" or ch2 == "xpcall"
+								or ch2:match("^task%.") or ch2:match("^coroutine%.")
+							add(ordinary and "low" or "high", "danger-as-argument",
+								line,
+								string.format("%s is passed as a value to %s%s",
+									passedDanger, tostring(chain or "a call"),
+									ordinary and " rather than called by name"
+										or " - a local function receiving require "
+										.. "as an argument is a trampoline"))
+						end
+						local ch = readChain(i)
+						if ch and WRAPPERS[ch] then
+							callee = V("factory", { root = passedDanger })
+						end
+					end
+
+					if callee.kind == "factory" then
+						-- get()(id): the first call hands back the function,
+						-- the second one is the call that matters.
+						local close = (tk[after].value == "(")
+							and matchClose(tk, after) or after
+						if close and tk[close + 1] and tk[close + 1].value == "(" then
+							after = close + 1
+							args = argValues(after)
+							a1 = args[1]
+						end
+						callee = V("danger", { root = callee.root })
+					end
+
+					if callee.kind == "danger" then
+						local root = callee.root
+						if root == "require" then
+							local chain = readChain(i)
+							if a1 and a1.kind == "number" then
+								add("critical", "require-asset-id", line,
+									string.format("require(%s) loads code from a "
+										.. "Roblox asset id at runtime - the most "
+										.. "common backdoor shape there is",
+										tostring(a1.raw or a1.value)))
+							elseif a1 and a1.kind == "string" then
+								-- require("Maid") is a Nevermore-style name loader;
+								-- require("@lune/fs") is a Lune build script. Both
+								-- are ordinary. Only an ASSEMBLED string is a tell.
+								add(a1.hidden and "critical" or "low",
+									"require-string", line,
+									"require() on a string" ..
+									(a1.hidden and " assembled at runtime" or ""))
+							else
+								if isNumberProducer(after + 1) then
+									add("critical", "require-asset-id", line,
+										"require(tonumber(...)) - the argument is "
+										.. "forced to a number, so this is loading "
+										.. "an asset id chosen at runtime")
+								end
+								local argChain = readChain(after + 1)
+								local root1 = argChain and argChain:match("^([%w_]+)")
+								if root1 and SAFE_ROOT[root1] then
+									-- require(script.Parent.X) - ordinary.
+								else
+									-- INFORMATIONAL ONLY, AND THIS IS THE POINT.
+									-- Scoring this HIGH is how v1 flagged Knit,
+									-- Rojo, folder loops and every OOP loader -
+									-- 12 of 15 false positives from one rule.
+									add("low", "require-dynamic", line,
+										string.format("require(%s) - target decided "
+											.. "at runtime. Normal in framework code; "
+											.. "listed only for completeness.",
+											tostring(argChain or "?")))
+								end
+							end
+							if chain and chain ~= "require" then
+								add("low", "aliased-require", line,
+									string.format("%q is an alias for require",
+										tostring(chain)))
+							end
+						elseif root == "loadstring" then
+							add("critical", "loadstring", line,
+								"loadstring() compiles a string as code at runtime")
+						elseif root == "getfenv" or root == "setfenv" then
+							add("low", root, line, root .. "() reads or replaces "
+								.. "the environment table")
+						end
+					end
+
+					-- self.fn(id) where somewhere above: L.fn = require
+					do
+						local ch = readChain(i)
+						local selfField = ch and ch:match("^self%.([%w_]+)$")
+						if selfField and dangerFields[selfField] then
+							-- An injectable/mockable require (`Cache.require = require`,
+							-- then `self.require(moduleScript)`) is a normal testing
+							-- pattern, and dangerFields is keyed on the bare field
+							-- name so unrelated `self.get(...)` collided with it.
+							-- dangerFields is keyed on the bare field name with no
+							-- receiver, so `ModuleCache.get = require` collided
+							-- with an unrelated `Inventory:get`. Until the
+							-- receiver is tracked properly this only reaches
+							-- HIGH when it carries an asset id; otherwise it is
+							-- an inventory row, not an alarm.
+							local sev = (a1 and a1.kind == "number")
+								and "critical" or "medium"
+							add(sev, "field-alias", line, string.format(
+								"self.%s was assigned %s earlier in this file%s",
+								selfField, dangerFields[selfField],
+								(a1 and a1.kind == "number")
+									and (" and is called with the asset id "
+										.. tostring(a1.raw or a1.value)) or ""))
+						end
+					end
+
+					-- HttpService egress
+					local chain = readChain(i)
+					local tail = chain and chain:match("%.([%w_]+)$")
+					if tail and HTTP_CALL[tail] then
+						local base = chain:sub(1, #chain - #tail - 1)
+						local bv = lookup(base, i)
+						if base:match("HttpService") or (bv and bv.kind == "http") then
+							-- Splitting a URL across two literals is line wrapping,
+							-- not hiding. v1 called that HIGH and flagged an
+							-- ordinary Discord webhook. Only character codes,
+							-- escapes and reversal count as hiding.
+							local hidden = (a1 and a1.hidden) and true or false
+							add(hidden and "high" or "medium", "http-egress", line,
+								string.format("HttpService:%s - data can leave the "
+									.. "game here%s", tail,
+									hidden and ". The address is built from "
+										.. "character codes, which only defeats "
+										.. "someone reading the source" or ""))
+						end
+					end
+
+					local built = decodeCharCall(i)
+					if built and ALARM_WORD[built] then
+						add("critical", "assembled-name", line,
+							string.format("character codes spell %q inline", built))
+					end
+
+				end
+			end
+			i = i + 1
+		end
+	end
+
+	---------------------------------------------------------------------
+	-- PASS 3 - the lexical backstop, and the reason the product works
+	---------------------------------------------------------------------
+	-- THE RESHAPE THAT CAME OUT OF THREE ROUNDS OF ADVERSARIES:
+	-- a verdict ("is this malicious?") is not something static analysis can
+	-- promise, because `require(id)` in a framework loader and `require(id)`
+	-- in a backdoor are the SAME SOURCE. The only difference is the value of
+	-- the id, and the value is not in the file.
+	--
+	-- An INVENTORY is promisable. "Here is every place this script can load
+	-- code at runtime" has a definite, checkable answer, and a developer
+	-- reading eight ranked lines decides in thirty seconds what a boolean
+	-- never could.
+	--
+	-- So the value tracker above RANKS, and this pass GUARANTEES COVERAGE:
+	-- every literal require/loadstring/InsertService token in an executable
+	-- position gets a row, even when the tracker could not follow the value.
+	-- Adversary #2 had seven samples the tracker never saw at all - an
+	-- if-expression, an IIFE, `false or require`, a variable table index.
+	-- Every one of them contains the word `require` in plain sight.
+	local LOADERS = { require = true, loadstring = true,
+		LoadAsset = true, LoadAssetVersion = true }
+	local inventory = 0
+	for n = 1, #tk do
+		local t = tk[n]
+		if t.type == "name" and LOADERS[t.value] then
+			local prev = tk[n - 1]
+			-- skip declarations, table keys and string mentions
+			local isKey = tk[n + 1] and tk[n + 1].value == "="
+				and not (tk[n + 2] and tk[n + 2].value == "=")
+			local isDecl = prev and prev.type == "keyword"
+				and (prev.value == "function" or prev.value == "local")
+			if not isKey and not isDecl then
+				inventory = inventory + 1
+				add("low", "code-load-site", t.line, string.format(
+					"%s appears here in an executable position. Every site is "
+					.. "listed whether or not the analyser could follow what it "
+					.. "loads - completeness is the promise, ranking is the "
+					.. "best effort.", t.value))
+			end
+		end
+	end
+
+	table.sort(findings, function(a, b)
+		if SEV[a.severity] ~= SEV[b.severity] then
+			return SEV[a.severity] > SEV[b.severity]
+		end
+		return (a.line or 0) < (b.line or 0)
+	end)
+
+	local worst = 0
+	for _, f in ipairs(findings) do
+		if SEV[f.severity] > worst then worst = SEV[f.severity] end
+	end
+
+	return { source = sourceName or "?", findings = findings,
+		flagged = worst >= SEV.high, worst = worst, tokenCount = #tk,
+		-- how many places this script can load code at all
+		siteCount = inventory,
+		listed = #findings > 0 }
+end
+
+Scanner.SEV = SEV
+-- Documented, deliberate misses. Do not pretend these are covered.
+Scanner.KNOWN_MISSES = {
+	"a value arriving through varargs (`local f = ...`)",
+	"a field assigned inside a method and called through `self`",
+	"decoding done in a loop the analyser does not execute",
+	"anything that needs real cross-function dataflow",
+}
+return Scanner
+
+]]></ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX3">
+      <Properties>
+        <string name="Name">Lexer</string>
+        <ProtectedString name="Source"><![CDATA[
+-- Lexer.lua - a real Luau tokenizer.
+--
+-- WHY THIS FILE IS THE WHOLE PRODUCT
+--   Every free backdoor scanner on the DevForum is a regex grep, and their own
+--   users say so:
+--       "This detects require( , no patterns. This can be easily bypassed just
+--        by doing: local foo = require / foo(1234)"
+--   A grep cannot see that, because to a grep `foo(1234)` is just a call to
+--   something called foo. A tokenizer plus alias tracking can.
+--
+-- DELIBERATELY PLAIN LUA
+--   No `continue`, no type annotations, no table.create/table.find/string.split.
+--   Luau is a superset of Lua 5.1, so keeping to the common subset means this
+--   file runs under a plain `lua` binary and can be unit-tested outside Studio.
+--   That is the difference between a scanner with a measured false-positive
+--   rate and one with an opinion.
+
+local Lexer = {}
+
+local KEYWORDS = {
+	["and"]=true,["break"]=true,["do"]=true,["else"]=true,["elseif"]=true,
+	["end"]=true,["false"]=true,["for"]=true,["function"]=true,["if"]=true,
+	["in"]=true,["local"]=true,["nil"]=true,["not"]=true,["or"]=true,
+	["repeat"]=true,["return"]=true,["then"]=true,["true"]=true,
+	["until"]=true,["while"]=true,
+	-- Luau additions that are contextual, listed so they are not mistaken
+	-- for ordinary identifiers when we look at what precedes a call.
+	["continue"]=true,
+}
+
+local ESCAPES = { a="\a", b="\b", f="\f", n="\n", r="\r", t="\t", v="\v",
+	["\\"]="\\", ['"']='"', ["'"]="'", ["\n"]="\n" }
+
+local function isDigit(c) return c >= "0" and c <= "9" end
+local function isHex(c)
+	return isDigit(c) or (c >= "a" and c <= "f") or (c >= "A" and c <= "F")
+end
+local function isNameStart(c)
+	return c == "_" or (c >= "a" and c <= "z") or (c >= "A" and c <= "Z")
+end
+local function isName(c) return isNameStart(c) or isDigit(c) end
+
+-- Reads [[...]] / [=[...]=]. Returns contents and the index after the close,
+-- or nil if this is not actually a long bracket.
+local function readLongBracket(src, i)
+	local j = i
+	if src:sub(j, j) ~= "[" then return nil end
+	j = j + 1
+	local level = 0
+	while src:sub(j, j) == "=" do level = level + 1; j = j + 1 end
+	if src:sub(j, j) ~= "[" then return nil end
+	j = j + 1
+	if src:sub(j, j) == "\n" then j = j + 1 end
+	local close = "]" .. string.rep("=", level) .. "]"
+	local s, e = src:find(close, j, true)
+	if not s then return src:sub(j), #src + 1 end
+	return src:sub(j, s - 1), e + 1
+end
+
+-- Reads a quoted string and DECODES its escapes, so `"\114\101\113..."`
+-- arrives at the analyser as the word it really spells. Obfuscation that
+-- survives the lexer is obfuscation the analyser has to guess at.
+local function readQuoted(src, i)
+	local quote = src:sub(i, i)
+	local out, j = {}, i + 1
+	while j <= #src do
+		local c = src:sub(j, j)
+		if c == quote then return table.concat(out), j + 1 end
+		if c == "\n" then return table.concat(out), j end -- unterminated
+		if c == "\\" then
+			local n = src:sub(j + 1, j + 1)
+			if ESCAPES[n] then
+				out[#out + 1] = ESCAPES[n]; j = j + 2
+			elseif n == "z" then
+				j = j + 2
+				while j <= #src and src:sub(j, j):match("%s") do j = j + 1 end
+			elseif n == "x" then
+				local hex = src:sub(j + 2, j + 3)
+				if hex:match("^%x%x$") then
+					out[#out + 1] = string.char(tonumber(hex, 16)); j = j + 4
+				else out[#out + 1] = n; j = j + 2 end
+			elseif n == "u" and src:sub(j + 2, j + 2) == "{" then
+				local close = src:find("}", j + 3, true)
+				if close then
+					local code = tonumber(src:sub(j + 3, close - 1), 16)
+					if code and code < 256 then
+						out[#out + 1] = string.char(code)
+					else
+						out[#out + 1] = "?"
+					end
+					j = close + 1
+				else out[#out + 1] = n; j = j + 2 end
+			elseif isDigit(n) then
+				local d = src:sub(j + 1):match("^%d%d?%d?")
+				local code = tonumber(d)
+				out[#out + 1] = (code and code < 256) and string.char(code) or "?"
+				j = j + 1 + #d
+			else
+				out[#out + 1] = n; j = j + 2
+			end
+		else
+			out[#out + 1] = c; j = j + 1
+		end
+	end
+	return table.concat(out), j
+end
+
+-- Returns a flat token list. Each token:
+--   { type = "name"|"keyword"|"string"|"number"|"op",
+--     value = string, line = number, raw = string|nil }
+-- Comments are dropped: nothing inside a comment can execute, and keeping
+-- them is how greps end up flagging a warning ABOUT backdoors as a backdoor.
+function Lexer.tokenize(src)
+	local tokens, i, line = {}, 1, 1
+	local n = #src
+
+	local function push(t, v, raw)
+		tokens[#tokens + 1] = { type = t, value = v, line = line, raw = raw }
+	end
+
+	while i <= n do
+		local c = src:sub(i, i)
+
+		if c == "\n" then
+			line = line + 1; i = i + 1
+		elseif c:match("%s") then
+			i = i + 1
+		elseif c == "-" and src:sub(i + 1, i + 1) == "-" then
+			local body, after = readLongBracket(src, i + 2)
+			if body then
+				local _, nl = body:gsub("\n", "")
+				line = line + nl; i = after
+			else
+				local nl = src:find("\n", i, true)
+				i = nl or (n + 1)
+			end
+		elseif c == "[" and src:sub(i + 1, i + 1):match("^[%[=]") then
+			local body, after = readLongBracket(src, i)
+			if body then
+				push("string", body)
+				local _, nl = body:gsub("\n", "")
+				line = line + nl; i = after
+			else
+				push("op", "["); i = i + 1
+			end
+		elseif c == '"' or c == "'" then
+			local body, after = readQuoted(src, i)
+			push("string", body, src:sub(i, after - 1))
+			i = after
+		elseif isDigit(c) or (c == "." and isDigit(src:sub(i + 1, i + 1))) then
+			local j = i
+			if c == "0" and src:sub(i + 1, i + 1):match("[xX]") then
+				j = i + 2
+				while j <= n and isHex(src:sub(j, j)) do j = j + 1 end
+			else
+				while j <= n and src:sub(j, j):match("[%d%.eE]") do
+					if src:sub(j, j):match("[eE]") and src:sub(j + 1, j + 1):match("[%+%-]") then
+						j = j + 1
+					end
+					j = j + 1
+				end
+			end
+			local text = src:sub(i, j - 1):gsub("_", "")
+			push("number", text); i = j
+		elseif isNameStart(c) then
+			local j = i
+			while j <= n and isName(src:sub(j, j)) do j = j + 1 end
+			local word = src:sub(i, j - 1)
+			push(KEYWORDS[word] and "keyword" or "name", word)
+			i = j
+		else
+			local three = src:sub(i, i + 2)
+			local two = src:sub(i, i + 1)
+			if three == "..." then push("op", three); i = i + 3
+			elseif two == "==" or two == "~=" or two == "<=" or two == ">="
+				or two == ".." or two == "::" or two == "->" then
+				push("op", two); i = i + 2
+			else
+				push("op", c); i = i + 1
+			end
+		end
+	end
+	push("op", "<eof>")
+	return tokens
+end
+
+return Lexer
+
+]]></ProtectedString>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>

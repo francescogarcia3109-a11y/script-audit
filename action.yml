@@ -1,0 +1,32 @@
+name: Script Audit
+description: Fail the build when a change adds a new way to load code at runtime in a Roblox codebase.
+author: Script Audit
+branding:
+  icon: shield
+  color: red
+
+inputs:
+  path:
+    description: Directory to scan (your Rojo src folder).
+    required: false
+    default: src
+  baseline:
+    description: Path to the committed baseline file.
+    required: false
+    default: .scriptaudit-baseline
+
+runs:
+  using: composite
+  steps:
+    - name: Install Lua
+      shell: bash
+      run: |
+        # The scanner is plain Lua on purpose - no Luau runtime, no Roblox
+        # account, no network. That is the whole reason it can run in CI.
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq lua5.4
+    - name: Check for new code-loading sites
+      shell: bash
+      run: |
+        lua5.4 "${{ github.action_path }}/cli/scriptaudit.lua" \
+          check "${{ inputs.path }}" -b "${{ inputs.baseline }}"
