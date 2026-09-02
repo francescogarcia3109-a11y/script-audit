@@ -58,6 +58,19 @@ t  "deleting a file does not fail"       0 $LUA "$CLI" check "$P"
 grep_out "reports it as gone" "gone since the baseline"
 
 t  "a nonexistent directory is exit 2"   2 $LUA "$CLI" scan "$TMP/no-such-dir"
+
+# The scanner used to try `find` and then fall back to a Windows `dir ... 2>nul`.
+# On Linux "nul" is a filename, not a null device, so any scan that found no
+# files silently created a stray file called `nul` in the working directory -
+# litter that lands in a commit. Platform is now detected, not guessed.
+EMPTY="$TMP/emptyproj"; mkdir -p "$EMPTY"
+GUARD="$TMP/nulguard"; mkdir -p "$GUARD"
+( cd "$GUARD" && $LUA "$CLI" scan "$EMPTY" >/dev/null 2>&1 )
+if [ -e "$GUARD/nul" ]; then
+  printf "FAIL  %-46s (stray 'nul' file created)\n" "scanning an empty dir leaves no litter"; fail=$((fail+1))
+else
+  printf "ok    %-46s\n" "scanning an empty dir leaves no litter"; pass=$((pass+1))
+fi
 t  "no arguments is exit 2"              2 $LUA "$CLI"
 
 # Determinism: the same tree must bless to the same bytes, or the baseline

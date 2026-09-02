@@ -43,24 +43,37 @@ local BASELINE_DEFAULT = ".scriptaudit-baseline"
 -- files
 ----------------------------------------------------------------------------
 
--- No lfs, no io.popen on Windows cmd. Try find first (Linux/macOS/CI), fall
--- back to dir. If neither works we say so rather than reporting zero files -
--- "found nothing" and "could not look" must never look the same.
+-- WHY THE PLATFORM IS DETECTED AND NOT GUESSED
+--   The first version simply tried `find` and then fell back to `dir`. Two
+--   problems, both found by actually running it:
+--
+--   1. `2>nul` is a Windows idiom. On Linux "nul" is not a null device, it is
+--      a FILENAME - so on any run where `find` returned nothing, the fallback
+--      quietly created a stray 167-byte file called `nul` in the working
+--      directory. In a repo that is litter that gets committed.
+--   2. Trying both means the second command runs on a machine it was never
+--      meant for, and whatever it prints gets parsed as if it were a file list.
+--
+--   package.config's first character is the path separator: "\" on Windows,
+--   "/" everywhere else. That is the standard way to ask, and it means each
+--   platform only ever runs its own command.
+local IS_WINDOWS = package.config:sub(1, 1) == "\\"
+
 local function listFiles(dir)
   local out = {}
-  local cmds = {
-    ('find "%s" -type f \\( -name "*.lua" -o -name "*.luau" \\) 2>/dev/null'):format(dir),
-    ('dir /b /s "%s\\*.lua*" 2>nul'):format(dir),
-  }
-  for _, cmd in ipairs(cmds) do
-    local p = io.popen(cmd)
-    if p then
-      for line in p:lines() do
-        if line:match("%.luau?$") then out[#out + 1] = line end
-      end
-      p:close()
-      if #out > 0 then break end
+  local cmd
+  if IS_WINDOWS then
+    cmd = ('dir /b /s "%s\\*.lua*" 2>nul'):format(dir)
+  else
+    cmd = ('find "%s" -type f \\( -name "*.lua" -o -name "*.luau" \\) 2>/dev/null'):format(dir)
+  end
+  local p = io.popen(cmd)
+  if p then
+    for line in p:lines() do
+      line = line:gsub("%s+$", "")
+      if line:match("%.luau?$") then out[#out + 1] = line end
     end
+    p:close()
   end
   table.sort(out)
   return out
