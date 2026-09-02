@@ -54,8 +54,20 @@ See `cli/README.md`, or copy `.github/workflows/script-audit.yml`.
 On the 61-script corpus — the author's, plus two independent adversaries' —
 coverage is **61/61** and false alarms are **0/61**.
 
+**Then it was tested again, blind.** A red-team adversary that had never seen
+`Scanner.lua`, `Lexer.lua` or any corpus file wrote 23 new backdoors and 16 new
+decoys against only the promise above. It aimed at cross-function dataflow,
+loaders pulled out of `select`/`coroutine`/`pcall`/`next`/`table.unpack`, keys
+built by XOR-decode and by carving `"require"` out of `"requirements.txt"`, and
+`__index` / `BindableFunction` indirection.
+
+**Coverage 23/23. False alarms 0/16.** For scale: the same test measured v1 at
+**0.31** recall and v2 at **0.053**. Those 39 scripts are now
+`corpus/holdout3-*` and gated in CI.
+
 **The ranking is not a promise.** It gets it right unaided **46 times out of
-61**. The other 15 are still listed, just not ranked loudly.
+61** on the original corpus, and **11 of 23** on the harder blind set. The rest
+are still listed, just not ranked loudly.
 
 That distinction is the entire design, and it was learned expensively. Two
 earlier versions claimed a verdict and scored 1.000/1.000 against corpora their
@@ -73,6 +85,7 @@ verdict, and it says so on screen.
 
 ```sh
 lua5.4 tests/run_corpus.lua            # coverage 61/61, false alarms 0/61
+lua5.4 tests/run_holdout3.lua          # blind adversary: 23/23, 0/16
 bash   cli/tests/run_cli_tests.sh      # 17 cases, exit codes included
 python tools/build_test_place.py       # a Studio place with a known answer
 python tools/build_stress_place.py 20000
@@ -93,7 +106,7 @@ src/Scanner.lua     the analysis. Runs under plain lua5.4
 plugin/             Studio wiring only
 cli/                the command line tool and its tests
 tools/              build the .rbxmx and the test places
-corpus/             61 scripts: author + two independent adversaries
+corpus/             61 scripts: author + two adversaries, plus a blind third
 tests/              the two numbers this scanner is allowed to claim
 ```
 
