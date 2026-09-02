@@ -10,6 +10,17 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0
 
+# "The tests failed" and "the tests could not run" are different facts. Without
+# this, a machine with no Lua reports 17 confident FAILures and someone spends
+# an evening debugging working code. The tool under test is careful to exit 2
+# rather than 1 when it cannot run; its own harness should be too.
+if ! command -v "$LUA" >/dev/null 2>&1; then
+  echo "cannot run: '$LUA' is not installed on this machine."
+  echo "  This is NOT a test failure - nothing was measured."
+  echo "  Install it (apt-get install lua5.4) or set LUA=/path/to/lua."
+  exit 2
+fi
+
 t() { # t <name> <expected-exit> <command...>
   local name="$1" want="$2"; shift 2
   "$@" >"$TMP/out" 2>&1; local got=$?
