@@ -1,0 +1,4 @@
+# scriptaudit baseline v1 - one line per file: <path><TAB><signature>
+# Regenerate with:  lua cli/scriptaudit.lua bless <dir>
+Lexer.lua	
+Scanner.lua	low|36|code-load-site;low|36|require-string;low|38|literal-name;low|39|literal-name
