@@ -1,0 +1,14 @@
+OVERALL: SUCCESS
+
+commit:    db9d0674839dab91cf27bafde3423c1e0568ecce
+branch:    main
+generated: 2026-09-03T13:05:42Z
+
+WORKFLOW               STATUS       CONCLUSION
+---------------------- ------------ ----------
+Script Audit           completed    success
+Tests                  completed    success
+
+--- links ---
+Script Audit: https://github.com/francescogarcia3109-a11y/script-audit/actions/runs/33759014733
+Tests: https://github.com/francescogarcia3109-a11y/script-audit/actions/runs/33759014556
