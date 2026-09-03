@@ -1,5 +1,8 @@
 # Script Audit
 
+[![Tests](https://github.com/francescogarcia3109-a11y/script-audit/actions/workflows/self-test.yml/badge.svg)](https://github.com/francescogarcia3109-a11y/script-audit/actions/workflows/self-test.yml)
+[![Script Audit](https://github.com/francescogarcia3109-a11y/script-audit/actions/workflows/script-audit.yml/badge.svg)](https://github.com/francescogarcia3109-a11y/script-audit/actions/workflows/script-audit.yml)
+
 **Lists every place a Roblox codebase can load code at runtime — and tells you
 when a change adds one that was not there before.**
 
