@@ -2,7 +2,14 @@
 # CLI's exit codes.
 name: Tests
 
-on: [push, pull_request]
+on:
+  # branches-ignore matters: the Publish CI status workflow pushes to
+  # ci-status, and without this that push would run these tests on a branch
+  # that contains only status.txt - they would fail, publish a red status,
+  # and trigger themselves again. Forever.
+  push:
+    branches-ignore: [ci-status]
+  pull_request:
 
 jobs:
   test:

@@ -1,0 +1,98 @@
+# Publishes this repo's CI result as a plain text file on an orphan branch, so
+# anything that can speak git - and nothing else - can read whether the build
+# passed:
+#
+#     git fetch origin ci-status && git show FETCH_HEAD:status.txt
+#
+# Why this exists: the Actions UI needs JavaScript, api.github.com needs a
+# token, and the status badges are SVG images. A read-only tool that has git
+# and no browser cannot otherwise find out whether a push went green.
+#
+# The branch holds exactly one file and never merges into main.
+name: Publish CI status
+
+on:
+  workflow_run:
+    workflows: ["Tests", "Script Audit"]
+    types: [completed]
+
+concurrency:
+  group: ci-status
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    # Never react to a run on our own branch. Without this, publishing to
+    # ci-status triggers Tests on that branch, which triggers this workflow,
+    # which publishes again - forever.
+    if: github.event.workflow_run.head_branch != 'ci-status'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect every check for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+          SELF: Publish CI status
+        run: |
+          set -euo pipefail
+
+          # All runs for this sha, not just the one that woke us, so the file
+          # is complete regardless of which workflow finished last.
+          gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" \
+            --jq '.workflow_runs[] | [.name, .status, (.conclusion // ""), .html_url] | @tsv' \
+            | sort -u > all.tsv
+
+          # Drop our own run: it is in_progress by definition while it looks.
+          grep -v -P "^\Q$SELF\E\t" all.tsv > runs.tsv || true
+
+          statuses=$(awk -F'\t' '{print ($2==""?"MISSING":$2)}' runs.tsv)
+          concls=$(  awk -F'\t' '{print ($3==""?"MISSING":$3)}' runs.tsv)
+
+          # Keyed off STATUS first, deliberately. An in-progress run can carry
+          # an empty conclusion; reading that as "not a failure" would report
+          # green while the build is still running, which is the one direction
+          # that must never happen.
+          if   [ ! -s runs.tsv ]; then verdict=UNKNOWN
+          elif printf '%s\n' "$statuses" | grep -qvx 'completed'; then verdict=PENDING
+          elif printf '%s\n' "$concls" | grep -qxE 'failure|timed_out|cancelled|action_required|startup_failure'; then verdict=FAILURE
+          elif printf '%s\n' "$concls" | grep -qxE 'MISSING|pending|null'; then verdict=PENDING
+          elif printf '%s\n' "$concls" | grep -qvxE 'success|skipped|neutral'; then verdict=UNKNOWN
+          else verdict=SUCCESS
+          fi
+
+          {
+            echo "OVERALL: $verdict"
+            echo
+            echo "commit:    $SHA"
+            echo "branch:    ${{ github.event.workflow_run.head_branch }}"
+            echo "generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            printf '%-22s %-12s %s\n' WORKFLOW STATUS CONCLUSION
+            printf '%-22s %-12s %s\n' ---------------------- ------------ ----------
+            awk -F'\t' '{printf "%-22s %-12s %s\n", $1, $2, ($3==""?"-":$3)}' runs.tsv
+            echo
+            echo "--- links ---"
+            awk -F'\t' '{print $1": "$4}' runs.tsv
+          } > status.txt
+
+          cat status.txt
+
+      - name: Push it to the ci-status branch
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git init -q pub && cd pub
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp ../status.txt .
+          git add status.txt
+          git commit -q -m "CI status for ${SHA:0:7}"
+          git push -q --force \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            HEAD:refs/heads/ci-status
+          echo "published refs/heads/ci-status"
